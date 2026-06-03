@@ -1,75 +1,163 @@
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain_core.prompts import PromptTemplate
-from langchain_groq import ChatGroq
-from langchain_core.runnables import RunnableParallel, RunnablePassthrough, RunnableLambda
-from langchain_core.output_parsers import StrOutputParser
-
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-import os
+
 load_dotenv()
-groq_key = os.getenv("GROQ_API_KEY")
-''' 
-                                INDEXING
-'''
-############################## DOCUMENT INGESTION ##############################
-video_id = "JMUxmLyrhSk"  
-try: 
-    ytt = YouTubeTranscriptApi()
-    transcript_list = ytt.fetch(video_id)
-    transcript = " ".join([t.text for t in transcript_list])
-#    print(transcript)  # Print the first 500 characters of the transcript
-    
-except TranscriptsDisabled:
-    print("Transcripts are disabled for this video.")
-######################################## DOCUMENT SPLITTING ##############################
-text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-chunks = text_splitter.create_documents([transcript])
-#print((chunks))  # Print the first 500 characters of the first chunk
-###################################### VECTOR STORE CREATION ##############################
-embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
-)
-vectorstore = FAISS.from_documents(chunks, embeddings)
-##################### RETRIVAL ###############################
-retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 4})
 
-############ AUGMENTATION ##############################
-
-llm = ChatGroq(
-    model="llama-3.3-70b-versatile",
-    temperature=0
+from models import (
+    ProcessVideoRequest, ProcessVideoResponse,
+    ChatRequest, ChatResponse,
+    HistoryResponse, HistoryItem,
 )
-prompt = PromptTemplate(
-    template="""
-    You are an helpful assistance. 
-    Providing answer from transcript ONLY.
-    If you dont know you say no idea but u will not hallucinate and say dont know.
-    {context}
-    Question:{question}
-    """,
-    input_variables = ['context','question']
+import session_store
+from rag import extract_video_id, load_or_build_vectorstore, answer_question
+from database_service import (
+    save_video_metadata,
+    save_message,
+    get_messages_by_session
+)
+
+app = FastAPI(
+    title="YouTube RAG API",
+    description="Chat with any YouTube video using RAG + LangChain + Groq",
+    version="1.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Restrict in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
-def format_docs(retrieved_docs):
-  context_text = "\n\n".join(doc.page_content for doc in retrieved_docs)
-  return context_text
+# ─────────────────────────────────────────────
+# HEALTH CHECK
+# ─────────────────────────────────────────────
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "YouTube RAG API is running"}
 
-########################## BUILDING CHAIN ##############################
 
-parallel_chain = RunnableParallel(
+# ─────────────────────────────────────────────
+# PROCESS VIDEO → Create session
+# ─────────────────────────────────────────────
+@app.post("/process-video", response_model=ProcessVideoResponse)
+def process_video(req: ProcessVideoRequest):
+    """
+    Accept a YouTube URL, fetch + embed transcript, return a session_id.
+    Subsequent /chat calls use this session_id.
+    """
+    try:
+        video_id = extract_video_id(req.youtube_url)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    {
-        "context": retriever | RunnableLambda(format_docs),
+    try:
+        vectorstore, metadata = load_or_build_vectorstore(video_id)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
 
-        "question": RunnablePassthrough()
-    }
-)
+    was_cached = metadata.get("cached", False) or _already_indexed(video_id)
+    session_id = session_store.create_session(video_id)
 
-parser = StrOutputParser()
+    save_video_metadata(
+        video_id=video_id,
+        chunk_count=metadata.get("chunk_count", 0),
+        transcript_length=metadata.get("transcript_length", 0)
+    )
 
-main_chain = parallel_chain | prompt | llm | parser
-print(main_chain.invoke('What is the video about?'))
+    return ProcessVideoResponse(
+        session_id=session_id,
+        video_id=video_id,
+        message="Video processed successfully. Start chatting!",
+        chunk_count=metadata.get("chunk_count", 0),
+        cached=was_cached,
+    )
+
+
+def _already_indexed(video_id: str) -> bool:
+    import os
+    return os.path.exists(f"cache/faiss_indexes/{video_id}")
+
+
+# ─────────────────────────────────────────────
+# CHAT
+# ─────────────────────────────────────────────
+@app.post("/chat", response_model=ChatResponse)
+def chat(req: ChatRequest):
+    """
+    Send a question for an active session. Returns the answer.
+    Conversation history is maintained automatically per session.
+    """
+    session = session_store.get_session(req.session_id)
+    if not session:
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found. Please process a video first via /process-video.",
+        )
+
+    video_id = session["video_id"]
+    vectorstore, _ = load_or_build_vectorstore(video_id)
+
+    try:
+        answer = answer_question(vectorstore, req.question, session["history"])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LLM error: {str(e)}")
+
+    session_store.add_turn(req.session_id, req.question, answer)
+
+    save_message(
+        session_id=req.session_id,
+        question=req.question,
+        answer=answer
+    )
+
+    return ChatResponse(
+        session_id=req.session_id,
+        question=req.question,
+        answer=answer,
+    )
+
+
+# ─────────────────────────────────────────────
+# HISTORY
+# ─────────────────────────────────────────────
+@app.get("/history/{session_id}", response_model=HistoryResponse)
+def get_history(session_id: str):
+    """Return full conversation history for a session."""
+    session = session_store.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found.")
+
+    messages = get_messages_by_session(session_id)
+
+    return HistoryResponse(
+        session_id=session_id,
+        video_id=session["video_id"],
+        history=[
+            HistoryItem(question=m.question, answer=m.answer)
+            for m in messages
+        ],
+    )
+
+
+# ─────────────────────────────────────────────
+# CLEAR SESSION
+# ─────────────────────────────────────────────
+@app.delete("/session/{session_id}")
+def delete_session(session_id: str):
+    """Delete a session and free its memory."""
+    deleted = session_store.delete_session(session_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    return {"message": f"Session {session_id} deleted."}
+
+
+# ─────────────────────────────────────────────
+# LIST SESSIONS (dev/debug)
+# ─────────────────────────────────────────────
+@app.get("/sessions")
+def list_sessions():
+    return {"sessions": session_store.list_sessions()}
